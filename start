@@ -1,0 +1,495 @@
+#!/usr/bin/env bash
+# ============================================================
+#  Crypto Alert Bot — Start Script v2
+#  Modular | Auto-Fix Missing Files | No venv | PEP 668 fix
+# ============================================================
+
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR"
+
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+LOG_DIR="logs"
+BOT_LOG="$LOG_DIR/bot.log"
+USERBOT_LOG="$LOG_DIR/userbot.log"
+PID_FILE="$LOG_DIR/pids"
+REQ_FILE="requirements.txt"
+ENV_FILE=".env"
+
+# ─── Warna ────────────────────────────────────────────────────
+if [ -t 1 ]; then
+  RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
+  CYAN='\033[0;36m'; MAGENTA='\033[0;35m'; BOLD='\033[1m'; NC='\033[0m'
+else
+  RED=''; GREEN=''; YELLOW=''; CYAN=''; MAGENTA=''; BOLD=''; NC=''
+fi
+
+log()   { echo -e "${CYAN}[$(date +%H:%M:%S)]${NC} $*"; }
+ok()    { echo -e "${GREEN}✔${NC} $*"; }
+warn()  { echo -e "${YELLOW}⚠${NC} $*"; }
+err()   { echo -e "${RED}✘${NC} $*" >&2; }
+title() { echo -e "\n${BOLD}${MAGENTA}═══ $* ═══${NC}"; }
+fix()   { echo -e "${YELLOW}🔧${NC} $*"; }
+
+# ─── Trap ─────────────────────────────────────────────────────
+cleanup() {
+  echo
+  warn "Menghentikan semua proses..."
+  if [ -f "$PID_FILE" ]; then
+    while IFS= read -r pid; do
+      kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true
+    done < "$PID_FILE"
+    sleep 1
+    while IFS= read -r pid; do
+      kill -0 "$pid" 2>/dev/null && kill -KILL "$pid" 2>/dev/null || true
+    done < "$PID_FILE"
+    rm -f "$PID_FILE"
+  fi
+  ok "Semua proses dihentikan."
+  exit 0
+}
+trap cleanup SIGINT SIGTERM EXIT
+
+declare -A PKG_TO_MODULE=(
+  ["python-dotenv"]="dotenv"
+  ["py-tgcalls"]="pytgcalls"
+  ["edge-tts"]="edge_tts"
+)
+
+get_module_name() {
+  local pkg="$1"
+  local name=$(echo "$pkg" | sed -E 's/[<>=!~].*//' | tr -d ' ')
+  if [ -n "${PKG_TO_MODULE[$name]:-}" ]; then
+    echo "${PKG_TO_MODULE[$name]}"
+  else
+    echo "$name" | tr '-' '_'
+  fi
+}
+
+# ═══════════════════════════════════════════════════════════════
+# AUTO-FIX: Template file yang bisa dibuat otomatis
+# ═══════════════════════════════════════════════════════════════
+
+write_file() {
+  local path="$1"
+  local content="$2"
+  mkdir -p "$(dirname "$path")"
+  echo "$content" > "$path"
+}
+
+fix_empty_init() {
+  local path="$1"
+  [ -f "$path" ] || { touch "$path"; fix "Buat: $path"; }
+}
+
+fix_portfolio_py() {
+  [ -f "database/portfolio.py" ] && return
+  fix "Auto-generate: database/portfolio.py"
+  cat > database/portfolio.py <<'PYEOF'
+import aiosqlite
+from config import DB_PATH
+from ._core import now
+
+
+# ── Portfolio (real) ──
+async def add_portfolio(uid, coin, amount, buy):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO portfolio (user_id, coin, amount, buy_price, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (uid, coin, amount, buy, now()))
+        await db.commit()
+
+
+async def get_portfolio(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM portfolio WHERE user_id=?", (uid,))
+        return await cur.fetchall()
+
+
+async def clear_portfolio(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM portfolio WHERE user_id=?", (uid,))
+        await db.commit()
+
+
+# ── Paper trading ──
+async def paper_get_balance(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM paper_balance WHERE user_id=?", (uid,))
+        row = await cur.fetchone()
+        if not row:
+            await db.execute(
+                "INSERT INTO paper_balance (user_id, balance, initial) VALUES (?, 10000, 10000)",
+                (uid,))
+            await db.commit()
+            cur = await db.execute("SELECT * FROM paper_balance WHERE user_id=?", (uid,))
+            row = await cur.fetchone()
+        return row
+
+
+async def paper_set_balance(uid, balance):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("UPDATE paper_balance SET balance=? WHERE user_id=?", (balance, uid))
+        await db.commit()
+
+
+async def paper_reset(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO paper_balance (user_id, balance, initial) "
+            "VALUES (?, 10000, 10000)", (uid,))
+        await db.execute("DELETE FROM paper_portfolio WHERE user_id=?", (uid,))
+        await db.commit()
+
+
+async def paper_add_holding(uid, coin, amount, buy_price):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO paper_portfolio (user_id, coin, amount, buy_price, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (uid, coin, amount, buy_price, now()))
+        await db.commit()
+
+
+async def paper_get_holdings(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM paper_portfolio WHERE user_id=?", (uid,))
+        return await cur.fetchall()
+
+
+async def paper_remove_holding(hid, uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "DELETE FROM paper_portfolio WHERE id=? AND user_id=?", (hid, uid))
+        await db.commit()
+PYEOF
+}
+
+fix_testcall_py() {
+  [ -f "userbot_app/testcall.py" ] && return
+  fix "Auto-generate: userbot_app/testcall.py"
+  cat > userbot_app/testcall.py <<'PYEOF'
+import asyncio
+import database as db
+from .caller import call_user
+
+
+async def monitor():
+    while True:
+        try:
+            req = await db.get_pending_test_call()
+            if req:
+                aid = req["admin_id"]
+                tid = req["id"]
+                print(f"📞 Test #{tid} → {aid}")
+                user = await db.get_user(aid)
+                voice = user["voice_choice"] if user else "ardi"
+                text = ("Tes panggilan dari Crypto Alert Bot. "
+                        "Jika Anda mendengar suara ini, userbot berjalan normal.")
+                ok = await call_user(aid, text, voice)
+                await db.complete_test_call(tid, "completed" if ok else "failed")
+                print(f"🏁 Test #{tid}: {'OK' if ok else 'FAILED'}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"❌ test: {e}")
+        await asyncio.sleep(5)
+PYEOF
+}
+
+fix_common_files() {
+  # __init__.py untuk semua folder
+  fix_empty_init "bot_app/__init__.py"
+  fix_empty_init "bot_app/handlers/__init__.py"
+  fix_empty_init "userbot_app/__init__.py"
+  fix_empty_init "services/__init__.py"
+  fix_empty_init "ui/__init__.py"
+
+  # File spesifik
+  fix_portfolio_py
+  fix_testcall_py
+}
+
+# ─── Banner ───────────────────────────────────────────────────
+clear
+cat <<'BANNER'
+╔══════════════════════════════════════════════════════════╗
+║        🚀  CRYPTO ALERT BOT  —  AUTO STARTER  🚀         ║
+║       Modular | Auto-Fix | Public Mode | Bot + User     ║
+╚══════════════════════════════════════════════════════════╝
+BANNER
+
+# ─── 1. Cek Python ────────────────────────────────────────────
+title "1/6  Memeriksa Python"
+if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+  err "$PYTHON_BIN tidak ditemukan. Install Python 3.9+ terlebih dahulu."
+  exit 1
+fi
+PY_VER="$($PYTHON_BIN -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')"
+PY_MAJOR="$($PYTHON_BIN -c 'import sys; print(sys.version_info.major)')"
+PY_MINOR="$($PYTHON_BIN -c 'import sys; print(sys.version_info.minor)')"
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 9 ]; }; then
+  err "Python $PY_VER terlalu lama. Butuh 3.9+."
+  exit 1
+fi
+ok "Python $PY_VER"
+
+# ─── 2. Cek ffmpeg ────────────────────────────────────────────
+title "2/6  Memeriksa ffmpeg"
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  warn "ffmpeg belum terinstall — fitur TTS telfon tidak akan berjalan"
+  if command -v apt >/dev/null 2>&1; then
+    log "Install via apt..."
+    sudo apt update -qq && sudo apt install -y ffmpeg >/dev/null 2>&1 \
+      && ok "ffmpeg terinstall" || warn "Gagal install"
+  elif command -v brew >/dev/null 2>&1; then
+    brew install ffmpeg >/dev/null 2>&1 && ok "ffmpeg terinstall" || warn "Gagal"
+  fi
+else
+  ok "ffmpeg terdeteksi"
+fi
+
+# ─── 3. Cek / Buat .env ──────────────────────────────────────
+title "3/6  Memeriksa .env"
+
+if [ ! -f "$ENV_FILE" ]; then
+  log ".env belum ada — membuat template..."
+  cat > "$ENV_FILE" <<'EOF'
+# ── Telegram API ──
+API_ID=
+API_HASH=
+BOT_TOKEN=
+USERBOT_SESSION=
+
+# ── Opsional ──
+SUPER_ADMIN_ID=
+CRYPTOPANIC_KEY=
+EOF
+  warn "Isi file .env terlebih dahulu:"
+  echo
+  echo -e "   ${BOLD}API_ID${NC}          → my.telegram.org"
+  echo -e "   ${BOLD}API_HASH${NC}        → my.telegram.org"
+  echo -e "   ${BOLD}BOT_TOKEN${NC}       → @BotFather"
+  echo -e "   ${BOLD}USERBOT_SESSION${NC} → StringSession"
+  echo -e "   ${BOLD}SUPER_ADMIN_ID${NC}  → (opsional) untuk /admin"
+  echo
+  echo -e "   Edit: ${CYAN}nano $ENV_FILE${NC}"
+  echo
+  exit 0
+fi
+
+check_env_value() {
+  local key="$1"
+  local line=$(grep -E "^${key}=" "$ENV_FILE" 2>/dev/null | head -n1 || true)
+  [ -z "$line" ] && { echo ""; return; }
+  local val="${line#*=}"
+  echo "$val" | sed -E "s/^[[:space:]'\"]+//; s/[[:space:]'\"]+$//"
+}
+
+REQUIRED_KEYS=("API_ID" "API_HASH" "BOT_TOKEN" "USERBOT_SESSION")
+MISSING=()
+for key in "${REQUIRED_KEYS[@]}"; do
+  [ -z "$(check_env_value "$key")" ] && MISSING+=("$key")
+done
+
+if [ ${#MISSING[@]} -gt 0 ]; then
+  err "File .env belum lengkap:"
+  for k in "${MISSING[@]}"; do echo -e "   • ${BOLD}$k${NC}"; done
+  echo -e "   Edit: ${CYAN}nano $ENV_FILE${NC}"
+  exit 1
+fi
+ok ".env lengkap"
+
+# ─── 4. Auto-Fix File Hilang ─────────────────────────────────
+title "4/6  Auto-fix struktur file"
+
+# Buat folder yang mungkin belum ada
+mkdir -p bot_app/handlers userbot_app database services ui
+
+# Buat __init__.py jika belum ada
+for d in bot_app bot_app/handlers userbot_app database services ui; do
+  [ -f "$d/__init__.py" ] || { touch "$d/__init__.py"; fix "Buat: $d/__init__.py"; }
+done
+
+# Auto-fix file yang sering hilang
+fix_portfolio_py
+fix_testcall_py
+
+ok "Auto-fix selesai"
+
+# ─── 5. Cek Dependencies ──────────────────────────────────────
+title "5/6  Memeriksa dependencies"
+
+if [ ! -f "$REQ_FILE" ]; then
+  err "$REQ_FILE tidak ditemukan!"
+  exit 1
+fi
+
+MISSING_PKG=()
+while IFS= read -r pkg; do
+  [ -z "$pkg" ] && continue
+  modname=$(get_module_name "$pkg")
+  if ! "$PYTHON_BIN" -c "import $modname" 2>/dev/null; then
+    MISSING_PKG+=("$pkg")
+  fi
+done < "$REQ_FILE"
+
+if [ ${#MISSING_PKG[@]} -eq 0 ]; then
+  ok "Semua library terpasang"
+else
+  log "Install ${#MISSING_PKG[@]} library..."
+  for m in "${MISSING_PKG[@]}"; do echo "   • $m"; done
+
+  PIP_FLAGS=("--user")
+  if ls /usr/lib/python3.*/EXTERNALLY-MANAGED >/dev/null 2>&1 \
+     || ls /usr/lib/python3/EXTERNALLY-MANAGED >/dev/null 2>&1; then
+    PIP_FLAGS+=("--break-system-packages")
+    warn "PEP 668 → pakai --user --break-system-packages"
+  fi
+
+  "$PYTHON_BIN" -m pip install --upgrade pip -q "${PIP_FLAGS[@]}" || true
+  if ! "$PYTHON_BIN" -m pip install -r "$REQ_FILE" -q "${PIP_FLAGS[@]}"; then
+    err "Gagal install. Coba: $PYTHON_BIN -m pip install ${PIP_FLAGS[*]} -r $REQ_FILE"
+    exit 1
+  fi
+  ok "Semua dependencies terinstall"
+fi
+
+# Verifikasi import
+log "Verifikasi import..."
+FAILED=()
+while IFS= read -r pkg; do
+  [ -z "$pkg" ] && continue
+  modname=$(get_module_name "$pkg")
+  if ! "$PYTHON_BIN" -c "import $modname" 2>/dev/null; then
+    FAILED+=("$pkg → $modname")
+  fi
+done < "$REQ_FILE"
+
+if [ ${#FAILED[@]} -gt 0 ]; then
+  err "Gagal import:"
+  for f in "${FAILED[@]}"; do echo "   • $f"; done
+  exit 1
+fi
+ok "Semua library OK"
+
+# Verifikasi file wajib (setelah auto-fix)
+log "Verifikasi file wajib..."
+REQUIRED_FILES=(
+  "config.py" "bot.py" "userbot.py"
+  "bot_app/client.py" "bot_app/helpers.py" "bot_app/handlers/__init__.py"
+  "userbot_app/client.py" "userbot_app/monitor.py"
+  "database/__init__.py" "database/_core.py"
+  "services/market.py" "services/prediction.py"
+  "ui/keyboards.py" "ui/texts.py"
+)
+STILL_MISSING=()
+for f in "${REQUIRED_FILES[@]}"; do
+  [ ! -f "$f" ] && STILL_MISSING+=("$f")
+done
+
+if [ ${#STILL_MISSING[@]} -gt 0 ]; then
+  err "File yang masih hilang (harus dibuat manual):"
+  for f in "${STILL_MISSING[@]}"; do echo "   • $f"; done
+  echo
+  echo -e "   ${YELLOW}File ini berisi logika utama, tidak bisa di-generate otomatis.${NC}"
+  echo -e "   Salin dari dokumentasi/referensi Anda."
+  exit 1
+fi
+ok "Semua file wajib tersedia"
+
+# ─── 6. Jalankan Bot + Userbot ────────────────────────────────
+title "6/6  Menjalankan Bot + Userbot"
+mkdir -p "$LOG_DIR"
+: > "$PID_FILE"
+
+run_with_restart() {
+  local name="$1"
+  local script="$2"
+  local logfile="$3"
+  local max_restart=5
+  local count=0
+
+  while [ $count -lt $max_restart ]; do
+    echo -e "\n[$(date '+%Y-%m-%d %H:%M:%S')] Starting $name (#$((count+1)))" >> "$logfile"
+    "$PYTHON_BIN" -u "$script" >> "$logfile" 2>&1
+    local ec=$?
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $name exit code=$ec" >> "$logfile"
+    count=$((count+1))
+    if [ $ec -ne 0 ] && [ $count -lt $max_restart ]; then
+      warn "$name crash — restart 5s... ($count/$max_restart)"
+      sleep 5
+    else
+      break
+    fi
+  done
+}
+
+run_with_restart "BOT" "bot.py" "$BOT_LOG" &
+BOT_PID=$!
+echo "$BOT_PID" >> "$PID_FILE"
+
+run_with_restart "USERBOT" "userbot.py" "$USERBOT_LOG" &
+USERBOT_PID=$!
+echo "$USERBOT_PID" >> "$PID_FILE"
+
+sleep 3
+
+if ! kill -0 "$BOT_PID" 2>/dev/null; then
+  err "Bot gagal start — cek: tail -50 $BOT_LOG"
+  exit 1
+fi
+if ! kill -0 "$USERBOT_PID" 2>/dev/null; then
+  err "Userbot gagal start — cek: tail -50 $USERBOT_LOG"
+  exit 1
+fi
+
+# Mode detection
+ADMIN_ID=$(check_env_value SUPER_ADMIN_ID)
+if [ -n "$ADMIN_ID" ]; then
+  ADMIN_MODE="👑 Admin (ID: $ADMIN_ID)"
+else
+  ADMIN_MODE="🌍 Publik"
+fi
+
+THUMB="❌"
+[ -f "thumbnail.jpg" ] && THUMB="🖼️ Ada"
+MUSIC="🎵 Tone default"
+[ -f "music.mp3" ] && MUSIC="🎵 music.mp3"
+
+cat <<EOF
+
+${BOLD}${GREEN}════════════════════════════════════════════════════════${NC}
+${BOLD}${GREEN}  ✅  SEMUA PROSES BERJALAN${NC}
+${BOLD}${GREEN}════════════════════════════════════════════════════════${NC}
+
+  🌐 Mode        : ${BOLD}$ADMIN_MODE${NC}
+  🤖 Bot PID     : ${BOLD}$BOT_PID${NC}
+  📞 Userbot PID : ${BOLD}$USERBOT_PID${NC}
+
+  🖼️ Thumbnail   : $THUMB
+  $MUSIC
+
+  📁 Logs:
+     • Bot      : ${CYAN}tail -f $BOT_LOG${NC}
+     • Userbot  : ${CYAN}tail -f $USERBOT_LOG${NC}
+
+  🛑 Berhenti: ${BOLD}Ctrl+C${NC}
+
+${BOLD}${GREEN}════════════════════════════════════════════════════════${NC}
+
+EOF
+
+log "Log real-time (Ctrl+C untuk berhenti)..."
+echo
+
+tail -F "$BOT_LOG" "$USERBOT_LOG" 2>/dev/null &
+TAIL_PID=$!
+echo "$TAIL_PID" >> "$PID_FILE"
+
+wait "$BOT_PID" "$USERBOT_PID" 2>/dev/null || true
