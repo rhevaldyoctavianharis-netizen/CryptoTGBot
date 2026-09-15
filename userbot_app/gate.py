@@ -30,9 +30,11 @@ async def can_call(user_id, alert):
     if priority == "low":
         return False, "Alert priority Low (chat only)"
 
-    if not user["contact_saved"]:
-        return False, "Kontak userbot belum disimpan"
-
+    # Cek status REAL ke Telegram dulu — ini sudah otomatis mempertimbangkan
+    # apakah target sudah jadi kontak & pengaturan privasi mereka. Flag
+    # `contact_saved` di DB cuma menandai "user pernah klik tombol konfirmasi
+    # di bot" dan TIDAK boleh jadi alasan blokir sendirian kalau Telegram
+    # sebenarnya sudah mengizinkan panggilan.
     available, private = await _check_privacy(user_id)
     await db.set_user_call_privacy(user_id, available, private)
 
@@ -40,7 +42,7 @@ async def can_call(user_id, alert):
         return False, "Privasi Anda memblokir panggilan dari non-kontak"
 
     if private and not user["contact_saved"]:
-        return False, "Privasi: hanya kontak yang bisa menelfon"
+        return False, "Privasi: hanya kontak yang bisa menelfon (konfirmasi simpan kontak di /start)"
 
     if priority != "critical":
         qs, qe = user["quiet_start"], user["quiet_end"]
